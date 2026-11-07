@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Repo Chat</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="shell">
+  <header class="bar">
+    <div class="brand">Repo Chat</div>
+    <div class="status" id="status">No repository loaded</div>
+  </header>
+
+  <main class="wrap">
+    <aside class="panel">
+      <h2>Load a repository</h2>
+      <p class="muted">Paste the web address of a public GitHub repository.</p>
+      <div class="field">
+        <label for="repoUrl">Repository URL</label>
+        <input type="url" id="repoUrl" placeholder="https://github.com/owner/repo">
+      </div>
+      <button id="loadBtn" class="btn btn-primary">Load &amp; index</button>
+      <div id="loadMsg" class="msg"></div>
+
+      <div class="divider"><span>Or start over</span></div>
+      <button id="resetBtn" class="btn btn-outline">Clear repository</button>
+      <div id="resetMsg" class="msg"></div>
+    </aside>
+
+    <section class="chat">
+      <div class="messages" id="messages"></div>
+      <form id="askForm" class="composer">
+        <input type="text" id="question" placeholder="Ask a question about the code..." disabled>
+        <button type="submit" id="sendBtn" class="btn btn-primary" disabled>Ask</button>
+      </form>
+    </section>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
