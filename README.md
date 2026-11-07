@@ -58,7 +58,6 @@ FastAPI backend (main.py)    http://localhost:8000
 Repo-Chat/
 ├── .env.example            # Template for environment variables (copy to .env)
 ├── .gitignore              # Files ignored by git
-├── LICENSE                 # MIT License
 ├── README.md               # This file
 ├── app.py                  # Streamlit frontend (chat UI)
 ├── cloner.py               # Git clone + repository file listing
@@ -263,10 +262,6 @@ Open `http://localhost:8501` in your browser. Paste a public GitHub URL, click *
 ## Contributing
 
 Contributions are welcome. Open an issue or submit a pull request on GitHub. Please keep the app logic unchanged and report bugs instead of fixing them silently.
-
-## License
-
-MIT License. See `LICENSE` for details.
 
 ## Author
 
