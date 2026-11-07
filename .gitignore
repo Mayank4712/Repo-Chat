@@ -20,6 +20,7 @@ yarn-error.log*
 *.log
 .chroma/
 chroma.sqlite3
+.repo_cache/
 data/
 *.db
 *.sqlite3

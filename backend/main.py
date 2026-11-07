@@ -6,12 +6,15 @@ and answers questions about the code with file/line citations.
 
 from __future__ import annotations
 
-import base64
 import hashlib
+import io
+import json
 import logging
 import os
 import re
-from typing import List, Optional
+import time
+import zipfile
+from typing import List, Optional, Tuple
 
 import chromadb
 import requests
@@ -39,6 +42,7 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.2-3b-instru
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", ".chroma")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_CACHE_DIR = os.getenv("GITHUB_CACHE_DIR", ".repo_cache")
 PORT = int(os.getenv("PORT", "8000"))
 
 MAX_FILES = 200
@@ -66,8 +70,8 @@ SKIP_DIRS = {
     "build", "dist", "target", ".next", "out",
 }
 
-REPO_URL_RE = re.compile(r"github\.com[:/](?P<owner>[^/]+)/(?P<repo>[^/?#]+?)(?:\.git)?/?$")
-
+GITHUB_API_BASE = "https://api.github.com"
+GITHUB_ARCHIVE_HOST = "github.com"
 
 # --------------------------------------------------------------------------- #
 # Pydantic models
@@ -75,6 +79,7 @@ REPO_URL_RE = re.compile(r"github\.com[:/](?P<owner>[^/]+)/(?P<repo>[^/?#]+?)(?:
 
 class LoadRepoRequest(BaseModel):
     repo_url: str
+    force_refresh: bool = False
 
 
 class AskRequest(BaseModel):
@@ -105,6 +110,53 @@ class Message(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# GitHub URL parsing
+# --------------------------------------------------------------------------- #
+
+
+def parse_repo_url(repo_url: str) -> Tuple[str, str, Optional[str]]:
+    """Parse a GitHub repository URL.
+
+    Returns (owner, repo, branch) where branch is None unless a
+    /tree/<branch>/... path was supplied.
+    """
+    url = repo_url.strip()
+
+    # scp-like syntax: git@github.com:owner/repo.git
+    if url.startswith("git@github.com:"):
+        url = "https://github.com/" + url[len("git@github.com:"):]
+
+    # Strip protocol and www.
+    url = re.sub(r"^https?://", "", url, flags=re.IGNORECASE)
+    url = re.sub(r"^www\.", "", url, flags=re.IGNORECASE)
+
+    if not url.lower().startswith("github.com/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid repository address. Use a GitHub URL like https://github.com/owner/repo",
+        )
+
+    rest = url[len("github.com/"):].rstrip("/")
+    if rest.lower().endswith(".git"):
+        rest = rest[:-4]
+
+    parts = rest.split("/")
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid repository address. Use a GitHub URL like https://github.com/owner/repo",
+        )
+
+    owner = parts[0]
+    repo = parts[1]
+    branch: Optional[str] = None
+    if len(parts) >= 4 and parts[2] == "tree":
+        branch = parts[3]
+
+    return owner, repo, branch
+
+
+# --------------------------------------------------------------------------- #
 # GitHub client
 # --------------------------------------------------------------------------- #
 
@@ -117,54 +169,90 @@ class GitHubClient:
             headers["Authorization"] = f"Bearer {token}"
         self.session.headers.update(headers)
 
-    def _handle(self, response: requests.Response, context: str) -> None:
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Send a request with retry for transient network errors only."""
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                return self.session.request(method, url, timeout=60, **kwargs)
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_exc = exc
+                if attempt < 2:
+                    log.warning(
+                        "Transient GitHub request error (attempt %d/3): %s", attempt + 1, exc
+                    )
+                    time.sleep(1 * (attempt + 1))
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc
+
+    def _handle_error(self, response: requests.Response, context: str) -> None:
+        """Raise an HTTPException with an accurate, user-friendly message.
+
+        Technical details are logged server-side (no secrets).
+        """
+        log.error(
+            "GitHub API error: %s %s -> %s %s headers=%s",
+            response.request.method,
+            response.url,
+            response.status_code,
+            response.reason,
+            {k: v for k, v in response.headers.items() if k.lower() != "authorization"},
+        )
+
+        remaining = response.headers.get("X-RateLimit-Remaining", "?")
+        reset_header = response.headers.get("X-RateLimit-Reset")
+        reset_msg = ""
+        if reset_header:
+            try:
+                reset_msg = f" It resets at {time.ctime(int(reset_header))}."
+            except (ValueError, TypeError):
+                reset_msg = ""
+
         if response.status_code == 401:
-            raise HTTPException(status_code=401, detail="GitHub authentication failed.")
-        if response.status_code == 403:
+            raise HTTPException(status_code=401, detail="The GitHub token is invalid or expired.")
+        if response.status_code in (403, 429):
+            if remaining == "0":
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "GitHub rate limit reached."
+                        + reset_msg
+                        + " Add a GITHUB_TOKEN to the backend .env to raise the limit "
+                        "(60 → 5,000 requests/hour)."
+                    ),
+                )
             raise HTTPException(
                 status_code=403,
-                detail="GitHub rate limit exceeded or repository not accessible.",
+                detail=f"GitHub access forbidden (remaining={remaining}).{reset_msg}",
             )
         if response.status_code == 404:
-            raise HTTPException(status_code=404, detail="Repository not found.")
-        if not response.ok:
-            raise HTTPException(
-                status_code=502,
-                detail=f"GitHub API error while {context}.",
-            )
+            raise HTTPException(status_code=404, detail="Repository not found, or it is private.")
+        raise HTTPException(
+            status_code=502,
+            detail=f"GitHub API error ({response.status_code} {response.reason}) while {context}.",
+        )
 
-    def parse_repo_url(self, repo_url: str) -> tuple[str, str]:
-        match = REPO_URL_RE.search(repo_url.strip())
-        if not match:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid repository address. Use a GitHub URL like https://github.com/owner/repo",
-            )
-        return match.group("owner"), match.group("repo")
+    def get_repo_info(self, owner: str, repo: str) -> dict:
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}"
+        resp = self._request("GET", url)
+        if not resp.ok:
+            self._handle_error(resp, "fetching repository info")
+        return resp.json()
 
-    def default_branch(self, owner: str, repo: str) -> str:
-        url = f"https://api.github.com/repos/{owner}/{repo}"
-        response = self.session.get(url, timeout=30)
-        self._handle(response, "fetching repository info")
-        return response.json()["default_branch"]
-
-    def list_files(self, owner: str, repo: str, ref: str) -> List[dict]:
-        url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{ref}?recursive=1"
-        response = self.session.get(url, timeout=60)
-        self._handle(response, "listing repository files")
-        data = response.json()
-        if data.get("truncated"):
-            log.warning("GitHub tree response was truncated")
-        return [t for t in data.get("tree", []) if t.get("type") == "blob"]
-
-    def file_content(self, owner: str, repo: str, path: str, ref: str) -> str:
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={ref}"
-        response = self.session.get(url, timeout=30)
-        self._handle(response, f"fetching file {path}")
-        data = response.json()
-        if data.get("encoding") == "base64":
-            return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-        return data.get("content", "")
+    def download_archive(self, owner: str, repo: str, ref: str) -> bytes:
+        """Download the repository as a zip archive (single request)."""
+        # Primary: github.com archive endpoint
+        url = f"https://{GITHUB_ARCHIVE_HOST}/{owner}/{repo}/archive/refs/heads/{ref}.zip"
+        resp = self._request("GET", url)
+        if not resp.ok:
+            # Fallback: codeload
+            url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{ref}"
+            resp = self._request("GET", url)
+        if not resp.ok:
+            self._handle_error(resp, f"downloading archive for {owner}/{repo}@{ref}")
+        return resp.content
 
 
 # --------------------------------------------------------------------------- #
@@ -210,6 +298,85 @@ def chunk_text(text: str, file_path: str) -> List[dict]:
         if i < 0:
             i = 0
     return chunks
+
+
+# --------------------------------------------------------------------------- #
+# Disk cache for extracted repo files (avoid re-downloading)
+# --------------------------------------------------------------------------- #
+
+
+def _cache_dir_path() -> str:
+    os.makedirs(GITHUB_CACHE_DIR, exist_ok=True)
+    return GITHUB_CACHE_DIR
+
+
+def _cache_file_path(repo_id: str) -> str:
+    return os.path.join(_cache_dir_path(), f"{repo_id}.json")
+
+
+def _load_cache(repo_id: str) -> Optional[List[dict]]:
+    path = _cache_file_path(repo_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        log.warning("Failed to read cache for %s", repo_id)
+        return None
+
+
+def _save_cache(repo_id: str, files: List[dict]) -> None:
+    path = _cache_file_path(repo_id)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(files, f, ensure_ascii=False)
+    except Exception as exc:
+        log.warning("Failed to write cache for %s: %s", repo_id, exc)
+
+
+# --------------------------------------------------------------------------- #
+# Archive extraction
+# --------------------------------------------------------------------------- #
+
+
+def extract_text_files(zip_bytes: bytes, max_files: int = MAX_FILES) -> List[dict]:
+    """Extract indexable text files from a GitHub zip archive.
+
+    Returns a list of dicts with keys: file, size, text.
+    GitHub archives contain a top-level folder like repo-branch/ which is
+    stripped so paths are relative to the repository root.
+    """
+    files: List[dict] = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        members = [m for m in zf.infolist() if not m.is_dir()]
+        for member in members:
+            if len(files) >= max_files:
+                break
+            path = member.filename
+            parts = path.split("/")
+            if len(parts) > 1:
+                path = "/".join(parts[1:])
+            if not path:
+                continue
+            if not is_indexable(path, member.file_size):
+                continue
+            try:
+                raw = zf.read(member)
+            except Exception:
+                log.warning("Failed to read %s from archive", member.filename)
+                continue
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                try:
+                    text = raw.decode("latin-1")
+                except Exception:
+                    continue
+            if not text.strip():
+                continue
+            files.append({"file": path, "size": member.file_size, "text": text})
+    return files
 
 
 # --------------------------------------------------------------------------- #
@@ -320,53 +487,71 @@ def status() -> StatusResponse:
 @app.post("/api/load-repo")
 def load_repo(request: LoadRepoRequest) -> dict:
     github = GitHubClient(GITHUB_TOKEN)
-    owner, repo = github.parse_repo_url(request.repo_url)
+    owner, repo, url_branch = parse_repo_url(request.repo_url)
+    repo_id = repo_id_for(owner, repo)
 
+    # Cache hit: reuse already-extracted files without re-downloading
+    if not request.force_refresh:
+        cached = _load_cache(repo_id)
+        if cached:
+            log.info("Cache hit for %s (%d files)", repo_id, len(cached))
+            return _build_index_from_files(cached, owner, repo, request.repo_url, repo_id)
+
+    # Fetch repo info to determine the default branch (one API call)
     try:
-        ref = github.default_branch(owner, repo)
-        trees = github.list_files(owner, repo, ref)
+        info = github.get_repo_info(owner, repo)
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover - network safety net
         log.exception("GitHub error")
         raise HTTPException(status_code=502, detail="Unable to reach GitHub.")
 
-    # Filter + fetch indexable files
-    chunks: List[dict] = []
-    seen_paths: set[str] = set()
-    fetched = 0
+    ref = url_branch or info.get("default_branch") or "master"
 
-    for entry in trees:
-        if fetched >= MAX_FILES:
-            break
-        path = entry.get("path", "")
-        if not is_indexable(path, entry.get("size", 0) or 0):
-            continue
-        if path in seen_paths:
-            continue
-        seen_paths.add(path)
-        fetched += 1
+    # Download the repository as a single zip archive (one request, no per-file API calls)
+    try:
+        zip_bytes = github.download_archive(owner, repo, ref)
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - network safety net
+        log.exception("Archive download error")
+        raise HTTPException(status_code=502, detail="Could not download the repository archive.")
 
-        try:
-            content = github.file_content(owner, repo, path, ref)
-        except HTTPException:
-            continue
-        except Exception:
-            log.warning("Failed to fetch %s", path)
-            continue
+    # Extract indexable text files from the archive
+    try:
+        files = extract_text_files(zip_bytes)
+    except Exception as exc:  # pragma: no cover
+        log.exception("Archive extraction error")
+        raise HTTPException(status_code=502, detail="Could not extract files from the repository archive.")
 
-        if not content.strip():
-            continue
-        chunks.extend(chunk_text(content, path))
-
-    if not chunks:
+    if not files:
         raise HTTPException(
             status_code=422,
             detail="No indexable text files found in the repository.",
         )
 
+    # Cache the extracted files so a reload avoids re-downloading
+    _save_cache(repo_id, files)
+
+    return _build_index_from_files(files, owner, repo, request.repo_url, repo_id)
+
+
+def _build_index_from_files(
+    files: List[dict], owner: str, repo: str, repo_url: str, repo_id: str
+) -> dict:
+    """Chunk, embed, and index a list of extracted file dicts."""
+    chunks: List[dict] = []
+    for f in files:
+        chunks.extend(chunk_text(f["text"], f["file"]))
+
+    if not chunks:
+        raise HTTPException(
+            status_code=422,
+            detail="No indexable text found in the repository.",
+        )
+
     # Truncate to a sane total chunk count
-    chunks = chunks[:MAX_FILES * 60]
+    chunks = chunks[: MAX_FILES * 60]
 
     # Embed
     embedder = get_embedder()
@@ -375,15 +560,17 @@ def load_repo(request: LoadRepoRequest) -> dict:
 
     # Chroma collection (fresh for this repo)
     client = get_chroma()
-    collection_name = repo_id_for(owner, repo)
     try:
-        client.delete_collection(name=collection_name)
+        client.delete_collection(name=repo_id)
     except Exception:
         pass
-    collection = client.create_collection(name=collection_name)
+    collection = client.create_collection(name=repo_id)
 
-    ids = [f"{i}" for i in range(len(chunks))]
-    metadatas = [{"file": c["file"], "start_line": c["start_line"], "end_line": c["end_line"]} for c in chunks]
+    ids = [str(i) for i in range(len(chunks))]
+    metadatas = [
+        {"file": c["file"], "start_line": c["start_line"], "end_line": c["end_line"]}
+        for c in chunks
+    ]
     collection.add(ids=ids, documents=texts, metadatas=metadatas, embeddings=embeddings.tolist())
 
     # BM25
@@ -392,18 +579,18 @@ def load_repo(request: LoadRepoRequest) -> dict:
 
     # Reset session state for new repo
     session.reset()
-    session.repo_url = request.repo_url
-    session.repo_id = collection_name
+    session.repo_url = repo_url
+    session.repo_id = repo_id
     session.indexed_count = len(chunks)
     session.chunks = chunks
     session.bm25 = bm25
     session._chroma_collection = collection
 
-    log.info("Indexed %d chunks from %s", len(chunks), request.repo_url)
+    log.info("Indexed %d chunks (%d files) from %s", len(chunks), len(files), repo_url)
     return {
         "message": "Repository indexed.",
         "indexed_count": len(chunks),
-        "repo_url": request.repo_url,
+        "repo_url": repo_url,
     }
 
 
